@@ -62,6 +62,7 @@ from fla.models.stickbreaking_attn import (
     StickBreakingAttentionModel,
 )
 from fla.models.transformer import TransformerConfig, TransformerForCausalLM, TransformerModel
+from fla.models.triadic_kda import TriadicKDAConfig, TriadicKDAForCausalLM, TriadicKDAModel
 from fla.models.wall_transformer import WallTransformerConfig, WallTransformerForCausalLM, WallTransformerModel
 from fla.models.yoco import YOCOConfig, YOCOForCausalLM, YOCOModel
 
@@ -189,6 +190,9 @@ __all__ = [
     'TransformerConfig',
     'TransformerForCausalLM',
     'TransformerModel',
+    'TriadicKDAConfig',
+    'TriadicKDAForCausalLM',
+    'TriadicKDAModel',
     'WallTransformerConfig',
     'WallTransformerForCausalLM',
     'WallTransformerModel',
