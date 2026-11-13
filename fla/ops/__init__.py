@@ -43,6 +43,7 @@ from fla.ops.rwkv6 import chunk_rwkv6, fused_recurrent_rwkv6
 from fla.ops.rwkv7 import chunk_rwkv7, fused_recurrent_rwkv7
 from fla.ops.simple_gla import chunk_simple_gla, fused_chunk_simple_gla, fused_recurrent_simple_gla, parallel_simple_gla
 from fla.ops.stickbreaking_attn import parallel_stickbreaking_attn
+from fla.ops.triadic_kda import chunk_triadic_kda, fused_recurrent_triadic_kda
 from fla.ops.wall_attn import parallel_wall_attn, parallel_wall_attn_decode
 
 __all__ = [
@@ -68,6 +69,7 @@ __all__ = [
     'chunk_rwkv6',
     'chunk_rwkv7',
     'chunk_simple_gla',
+    'chunk_triadic_kda',
     'fused_attnres',
     'fused_chunk_based',
     'fused_chunk_delta_rule',
@@ -97,6 +99,7 @@ __all__ = [
     'fused_recurrent_rwkv6',
     'fused_recurrent_rwkv7',
     'fused_recurrent_simple_gla',
+    'fused_recurrent_triadic_kda',
     'parallel_attn',
     'parallel_based',
     'parallel_forgetting_attn',
