@@ -12,6 +12,9 @@ import triton.language as tl
 from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices, prepare_chunk_offsets, solve_tril
 
 CHUNK_SIZE = 64
+# a midpoint anchor keeps every exponent within half the cumulative decay span of its block,
+# wider spans take the pairwise gate differences so that no exponent can overflow
+MAX_ANCHOR_SPAN = tl.constexpr(64.0)
 
 
 @triton.jit
@@ -120,12 +123,21 @@ def chunk_triadic_kda_fwd_kernel_scores_k(
 
         first_g = tl.max(tl.where(oi[:, None] == 0, gi, float('-inf')), 0)
         last_g = tl.min(tl.where(mi, gi, float('inf')), 0)
-        anchor = 0.5 * (first_g + last_g)
-        gq = tl.where(mi, tl.exp(gi - anchor[None, :]), 0.0)
-        gk_inv = tl.where(mi, tl.exp(anchor[None, :] - gi), 0.0)
-        kgt = tl.trans(ki * gk_inv)
-        erase_d = tl.dot(ki * gq, kgt, erase_d, input_precision='ieee')
-        query_d = tl.dot(qi * gq, kgt, query_d, input_precision='ieee')
+        if tl.max(first_g - last_g, 0) <= MAX_ANCHOR_SPAN:
+            anchor = 0.5 * (first_g + last_g)
+            gq = tl.where(mi, tl.exp(gi - anchor[None, :]), 0.0)
+            gk_inv = tl.where(mi, tl.exp(anchor[None, :] - gi), 0.0)
+            kgt = tl.trans(ki * gk_inv)
+            erase_d = tl.dot(ki * gq, kgt, erase_d, input_precision='ieee')
+            query_d = tl.dot(qi * gq, kgt, query_d, input_precision='ieee')
+        else:
+            for col in range(BC):
+                m_col = oi == col
+                g_col = tl.sum(tl.where(m_col[:, None], gi, 0.0), 0)
+                k_col = tl.sum(tl.where(m_col[:, None], ki, 0.0), 0)
+                kg = k_col[None, :] * tl.exp(tl.minimum(gi - g_col[None, :], 0.0))
+                erase_d += tl.where(m_col[None, :], tl.sum(ki * kg, 1)[:, None], 0.0)
+                query_d += tl.where(m_col[None, :], tl.sum(qi * kg, 1)[:, None], 0.0)
 
     pa_diag = (ti[:, None] * H + h) * BT + (block * BC + oi)[None, :]
     tl.store(L_axis + pa_diag, tl.where(m_causal, erase_d, 0.0), (ti < end)[:, None])
@@ -464,7 +476,8 @@ def chunk_triadic_kda_fwd(
     keys = [torch.empty_like(k, dtype=torch.bfloat16) for _ in range(3)]
     Lk, Mk = fwd_intra(q, k, q2, k2, beta, gk, g2, cu, indices, Akk=Akk, Aqk=Aqk, keys=keys)
     Ai = solve_tril(A=Akk, cu_seqlens=cu, chunk_indices=indices, output_dtype=torch.bfloat16)
-    o, ht, states, u = fwd_h(v, beta, q2, k2, gk, g2, Ai, Aqk, keys, h0, cu, indices, scale, save=save, output=True, final=final)
+    o, ht, states, u = fwd_h(v, beta, q2, k2, gk, g2, Ai, Aqk, keys, h0, cu,
+                             indices, scale, save=save, output=True, final=final)
     if not save:
         keys = [None] * 3
 

@@ -184,6 +184,82 @@ def test_chunk(
 
 
 @pytest.mark.parametrize(
+    ('B', 'T', 'H', 'K', 'V', 'E', 'gk_scale', 'g2_scale', 'disable_recompute', 'dtype'),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-K{}-V{}-E{}-gk_scale{}-g2_scale{}-disable_recompute{}-{}".format(*test),
+        )
+        for test in [
+            (2, 130, 2, 64, 64, 4, 10.0, 0.5, False, torch.bfloat16),
+            (2, 130, 2, 64, 64, 4, 25.0, 0.5, False, torch.bfloat16),
+            (2, 130, 2, 64, 64, 4, 0.5, 25.0, False, torch.bfloat16),
+            (2, 130, 2, 64, 64, 4, 32.0, 32.0, False, torch.float32),
+            (1, 257, 2, 100, 96, 8, 32.0, 32.0, True, torch.bfloat16),
+        ]
+    ],
+)
+def test_chunk_strong_decay(
+    B: int,
+    T: int,
+    H: int,
+    K: int,
+    V: int,
+    E: int,
+    gk_scale: float,
+    g2_scale: float,
+    disable_recompute: bool,
+    dtype: torch.dtype,
+):
+    # per-token log decays average about -0.5 * scale, so a 16-token diagonal block spans up to about 240
+    torch.manual_seed(42)
+    q, k, v, k2, q2, gk, g2, beta = _make_inputs(B, T, H, K, V, E, 1.0, dtype)
+    h0 = torch.randn(B, H, E, K, V, dtype=torch.float32, device=device)
+    inputs = [x.requires_grad_(True) for x in (q, k, v, k2, q2, gk * gk_scale, g2 * g2_scale, beta, h0)]
+    q, k, v, k2, q2, gk, g2, beta, h0 = inputs
+    do, dht = torch.randn_like(v), torch.randn_like(h0)
+
+    ref, ref_ht = naive_recurrent_triadic_kda(
+        q=q,
+        k=k,
+        v=v,
+        k2=k2,
+        q2=q2,
+        gk=gk,
+        g2=g2,
+        beta=beta,
+        initial_state=h0,
+        output_final_state=True,
+    )
+    ref_grads = torch.autograd.grad((ref * do).sum() + (ref_ht * dht).sum(), inputs)
+
+    tri, tri_ht = chunk_triadic_kda(
+        q=q,
+        k=k,
+        v=v,
+        k2=k2,
+        q2=q2,
+        gk=gk,
+        g2=g2,
+        beta=beta,
+        initial_state=h0,
+        output_final_state=True,
+        disable_recompute=disable_recompute,
+    )
+    tri_grads = torch.autograd.grad((tri * do).sum() + (tri_ht * dht).sum(), inputs)
+
+    assert_close('o', ref, tri, 0.005)
+    assert_close('ht', ref_ht, tri_ht, 0.005)
+    for name, ref_grad, tri_grad, ratio in zip(
+        ('dq', 'dk', 'dv', 'dk2', 'dq2', 'dgk', 'dg2', 'dbeta', 'dh0'),
+        ref_grads,
+        tri_grads,
+        (0.008, 0.008, 0.008, 0.008, 0.008, 0.02, 0.02, 0.02, 0.008),
+    ):
+        assert_close(name, ref_grad, tri_grad, ratio)
+
+
+@pytest.mark.parametrize(
     ('H', 'K', 'V', 'E', 'cu_seqlens', 'in_kernel_gates', 'lower_bound', 'disable_recompute'),
     [
         pytest.param(

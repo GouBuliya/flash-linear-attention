@@ -11,6 +11,7 @@ import triton.language as tl
 
 from fla.ops.triadic_kda.chunk_fwd import (
     CHUNK_SIZE,
+    MAX_ANCHOR_SPAN,
     chunk_position,
     fwd_h,
     fwd_intra,
@@ -207,7 +208,7 @@ def chunk_triadic_kda_bwd_kernel_inter(
     acc_r = tl.zeros((BT, BK), tl.float32)
     b_beta = tl.load(beta + tt * H + h, mt, other=0.0).to(tl.float32)
 
-    for e in tl.range(E, disable_licm=True):
+    for e in tl.range(E):
         ge = tl.load(g2 + pe + e, mt, other=0.0)
         exp_ge = tl.exp(ge)
         contraction_q = tl.zeros((BT, BK), tl.float32)
@@ -252,7 +253,7 @@ def chunk_triadic_kda_bwd_kernel_inter(
     acc_k = tl.zeros((BT, BK), tl.float32)
     last_grad = tl.zeros((BK,), tl.float32)
 
-    for e in tl.range(E, disable_licm=True):
+    for e in tl.range(E):
         ge = tl.load(g2 + pe + e, mt, other=0.0)
         gel = tl.load(g2 + (last * H + h) * E + e)
         exp_gek = tl.exp(tl.minimum(gel - ge, 0.0))
@@ -335,7 +336,8 @@ def chunk_triadic_kda_bwd_kernel_matrices(
         dz = tl.load(dx + p, mask, other=0.0)
         vv_f = tl.load(v + p, mask, other=0.0).to(tl.float32)
         da -= tl.dot(dz.to(tl.float32), tl.trans(uu).to(tl.float32), input_precision='ieee')
-        dm += tl.dot(tl.load(do + p, mask, other=0.0).to(tl.float32), tl.trans(uu).to(tl.float32), input_precision='ieee') * scale
+        dm += tl.dot(tl.load(do + p, mask, other=0.0).to(tl.float32),
+                     tl.trans(uu).to(tl.float32), input_precision='ieee') * scale
         tl.store(dv + p, dz * b_beta[:, None], mask)
         dbeta_acc += tl.sum(dz * vv_f, 1)
 
@@ -396,7 +398,7 @@ def chunk_triadic_kda_bwd_kernel_scores_e(
 
         first_g = tl.max(tl.where(t == 0, gi, float('-inf')), 0)
         last_g = tl.min(tl.where(mask, gi, float('inf')), 0)
-        if first_g - last_g <= 64.0:
+        if first_g - last_g <= MAX_ANCHOR_SPAN:
             anchor = 0.5 * (first_g + last_g)
             left = tl.exp(tl.where(mask, gi - anchor, 0.0))
             right = tl.exp(tl.where(mask, anchor - gi, 0.0))
@@ -547,32 +549,57 @@ def chunk_triadic_kda_bwd_kernel_scores_k(
 
     # diagonal [BC, BC] sub-block
     oi = tl.arange(0, BC).to(tl.int64)
-    first_g = tl.max(tl.where(oi[:, None] == 0, gi, float('-inf')), 0)
-    last_g = tl.min(tl.where(mi, gi, float('inf')), 0)
-    anchor = 0.5 * (first_g + last_g)
-    gq = tl.where(mi, tl.exp(gi - anchor[None, :]), 0.0)
-    gk_inv = tl.where(mi, tl.exp(anchor[None, :] - gi), 0.0)
-
     first_g2 = tl.max(tl.where(oi[:, None] == 0, g2_i, float('-inf')), 0)
     last_g2 = tl.min(tl.where(me_i, g2_i, float('inf')), 0)
-    anchor2 = 0.5 * (first_g2 + last_g2)
-    gq2 = tl.where(me_i, tl.exp(g2_i - anchor2[None, :]), 0.0)
-    gk2_inv = tl.where(me_i, tl.exp(anchor2[None, :] - g2_i), 0.0)
-    k2_gt_d = tl.trans(k2_i * gk2_inv)
-    l2_d = tl.dot(r2_i * gq2, k2_gt_d, input_precision='ieee')
-    m2_d = tl.dot(q2_i * gq2, k2_gt_d, input_precision='ieee')
+    if tl.max(first_g2 - last_g2, 0) <= MAX_ANCHOR_SPAN:
+        anchor2 = 0.5 * (first_g2 + last_g2)
+        gq2 = tl.where(me_i, tl.exp(g2_i - anchor2[None, :]), 0.0)
+        gk2_inv = tl.where(me_i, tl.exp(anchor2[None, :] - g2_i), 0.0)
+        k2_gt_d = tl.trans(k2_i * gk2_inv)
+        l2_d = tl.dot(r2_i * gq2, k2_gt_d, input_precision='ieee')
+        m2_d = tl.dot(q2_i * gq2, k2_gt_d, input_precision='ieee')
+    else:
+        l2_d = tl.zeros((BC, BC), tl.float32)
+        m2_d = tl.zeros((BC, BC), tl.float32)
+        for col2 in range(BC):
+            m_col2 = oi == col2
+            g2_col = tl.sum(tl.where(m_col2[:, None], g2_i, 0.0), 0)
+            k2_col = tl.sum(tl.where(m_col2[:, None], k2_i, 0.0), 0)
+            k2_g = k2_col[None, :] * tl.exp(tl.minimum(g2_i - g2_col[None, :], 0.0))
+            l2_d += tl.where(m_col2[None, :], tl.sum(r2_i * k2_g, 1)[:, None], 0.0)
+            m2_d += tl.where(m_col2[None, :], tl.sum(q2_i * k2_g, 1)[:, None], 0.0)
 
     pa = (ti[:, None] * H + h) * BT + (block * BC + oi)[None, :]
     ma = (ti < end)[:, None] & (ti < end)[None, :] & (oi[:, None] >= oi[None, :])
     dl_d = tl.load(dA + pa, ma, other=0.0) * tl.where(ma, l2_d, 0.0)
     dm_d = tl.load(dM + pa, ma, other=0.0) * tl.where(ma, m2_d, 0.0)
-    k_scaled = ki.to(tl.float32) * gk_inv
-    vq += tl.dot(dm_d, k_scaled, input_precision='ieee') * gq
-    vr += tl.dot(dl_d, k_scaled, input_precision='ieee') * gq
-    vk += (
-        tl.dot(tl.trans(dl_d), ri * gq, input_precision='ieee')
-        + tl.dot(tl.trans(dm_d), qi.to(tl.float32) * gq, input_precision='ieee')
-    ) * gk_inv
+
+    first_g = tl.max(tl.where(oi[:, None] == 0, gi, float('-inf')), 0)
+    last_g = tl.min(tl.where(mi, gi, float('inf')), 0)
+    if tl.max(first_g - last_g, 0) <= MAX_ANCHOR_SPAN:
+        anchor = 0.5 * (first_g + last_g)
+        gq = tl.where(mi, tl.exp(gi - anchor[None, :]), 0.0)
+        gk_inv = tl.where(mi, tl.exp(anchor[None, :] - gi), 0.0)
+        k_scaled = ki.to(tl.float32) * gk_inv
+        vq += tl.dot(dm_d, k_scaled, input_precision='ieee') * gq
+        vr += tl.dot(dl_d, k_scaled, input_precision='ieee') * gq
+        vk += (
+            tl.dot(tl.trans(dl_d), ri * gq, input_precision='ieee')
+            + tl.dot(tl.trans(dm_d), qi.to(tl.float32) * gq, input_precision='ieee')
+        ) * gk_inv
+    else:
+        for col in range(BC):
+            m_col = oi == col
+            g_col = tl.sum(tl.where(m_col[:, None], gi, 0.0), 0)
+            r_col = tl.sum(tl.where(m_col[:, None], ri, 0.0), 0)
+            dl_col = tl.sum(tl.where(m_col[None, :], dl_d, 0.0), 1)
+            dm_col = tl.sum(tl.where(m_col[None, :], dm_d, 0.0), 1)
+            decay = tl.exp(tl.minimum(gi - g_col[None, :], 0.0))
+            kg = r_col[None, :] * decay
+            vq += dm_col[:, None] * kg
+            vr += dl_col[:, None] * kg
+            vk_col = tl.sum((dl_col[:, None] * ri + dm_col[:, None] * qi.to(tl.float32)) * decay, 0)
+            vk += tl.where(m_col[:, None], vk_col[None, :], 0.0)
 
     # accumulate into the saved first-axis gradients
     vg = qi * vq + ri * vr - ki * vk
@@ -595,7 +622,8 @@ def chunk_triadic_kda_bwd(v, beta, q, k, q2, k2, gk, g2, Ai, Aqk, states, u, Lk,
         keys = [torch.empty_like(k, dtype=torch.bfloat16) for _ in range(3)]
         Akk = k.new_empty(B, T, H, CHUNK_SIZE, dtype=torch.float32)
         Lk, Mk = fwd_intra(q, k, q2, k2, beta, gk, g2, cu, indices, Akk=Akk, Aqk=Aqk, keys=keys)
-        _, _, states, u = fwd_h(v, beta, q2, k2, gk, g2, Ai, Aqk, keys, h0, cu, indices, scale, save=True, output=False, final=False)
+        _, _, states, u = fwd_h(v, beta, q2, k2, gk, g2, Ai, Aqk, keys, h0, cu,
+                                indices, scale, save=True, output=False, final=False)
 
     pq, pkp, pr = keys
     dx, dh = torch.empty_like(u), torch.empty_like(states)
